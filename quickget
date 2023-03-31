@@ -54,6 +54,7 @@ function pretty_name() {
     netboot)            PRETTY_NAME="netboot.xyz";;
     netbsd)             PRETTY_NAME="NetBSD";;
     nixos)              PRETTY_NAME="NixOS";;
+    nixos-arm64)        PRETTY_NAME="NixOS ARM64";;
     macos)              PRETTY_NAME="macOS";;
     openbsd)            PRETTY_NAME="OpenBSD";;
     opensuse)           PRETTY_NAME="openSUSE";;
@@ -198,6 +199,7 @@ function os_support() {
     netboot \
     netbsd \
     nixos \
+    nixos-arm64 \
     lubuntu \
     macos \
     openbsd \
@@ -446,7 +448,15 @@ function releases_nixos(){
     echo 21.05 21.11 22.05 22.11
 }
 
+function releases_nixos-arm64(){
+    echo 22.11
+}
+
 function editions_nixos(){
+    echo gnome plasma5 minimal
+}
+
+function editions_nixos-arm64(){
     echo gnome plasma5 minimal
 }
 
@@ -1400,6 +1410,15 @@ function get_nixos() {
     local EDITION="${1:-}"
     local HASH=""
     local ISO="latest-nixos-${EDITION}-x86_64-linux.iso"
+    local URL="https://channels.nixos.org/nixos-${RELEASE}"
+    HASH=$(wget -q -O- "${URL}/${ISO}.sha256" | cut -d' ' -f1)
+    echo "${URL}/${ISO} ${HASH}"
+}
+
+function get_nixos-arm64() {
+    local EDITION="${1:-}"
+    local HASH=""
+    local ISO="latest-nixos-${EDITION}-aarch64-linux.iso"
     local URL="https://channels.nixos.org/nixos-${RELEASE}"
     HASH=$(wget -q -O- "${URL}/${ISO}.sha256" | cut -d' ' -f1)
     echo "${URL}/${ISO} ${HASH}"
