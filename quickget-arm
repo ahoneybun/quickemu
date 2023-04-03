@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+export LC_ALL=C
+
+# Here the quick 'n dirty guide to adding a new OS to quickget
+#
+#  1. Update os_support() - add new OS, all lowercase
+#  2. Update pretty_name() - add a pretty name for new OS *only if the catch all is not suitable*
+#  3. Create a releases_newos() generator (required) outputs the current supported release versions
+#  4. Create a editions_newos() generator (optional) outputs the editions if new OS has multiple flavours/editions
+#  5. Update make_vm_config() - add any *required* new OS tweaks
+#  6. Create a get_newos() function - that does something like this:
+#     function get_newos() {
+#         local EDITION="${1:-}"
+#         local HASH=""
+#         local ISO="newos-${RELEASE}-${EDITION}-amd64.iso"
+#         local URL="https://www.newos.org/download/${RELEASE}/${EDITION}"
+#
+#         HASH=$(wget -q -O- "${URL}/SHA512SUMS" | grep "${ISO}" | cut -d' ' -f1)
+#         echo "${URL}/${ISO} ${HASH}"
+#     }
+
+function cleanup() {
+  if [ -n "$(jobs -p)" ]; then
+    kill "$(jobs -p)"
+  fi
+}
+
+function pretty_name() {
+  local SIMPLE_NAME=""
+  local PRETTY_NAME=""
+  SIMPLE_NAME="${1}"
+  case ${SIMPLE_NAME} in
+    nixos)        PRETTY_NAME="NixOS";;
+    *)                  PRETTY_NAME="${SIMPLE_NAME^}";;
+  esac
+  echo "${PRETTY_NAME}"
+}
+
+function validate_release() {
+  local DISPLAY_NAME=""
+  local RELEASE_GENERATOR=""
+  local RELEASES=""
+
+  DISPLAY_NAME="$(pretty_name "${OS}")"
+  case ${OS} in
+    *ubuntu*) RELEASE_GENERATOR="releases_ubuntu";;
+    *) RELEASE_GENERATOR="${1}";;
+  esac
+
+  RELEASES=$(${RELEASE_GENERATOR})
+  if [[ "${RELEASES}" != *"${RELEASE}"* ]]; then
+      echo -e "ERROR! ${DISPLAY_NAME} ${RELEASE} is not a supported release.\n"
+      echo -n "${RELEASES}"
+      exit 1
+  fi
+}
+
+function list_json() {
+  # Reference: https://stackoverflow.com/a/67359273
+  list_csv | jq -R 'split(",") as $h|reduce inputs as $in ([]; . += [$in|split(",")|. as $a|reduce range(0,length) as $i ({};.[$h[$i]]=$a[$i])])'
+  exit 0
+}
+
+function list_csv() {
+  local DISPLAY_NAME
+  local DL=""
+  local DOWNLOADER
+  local FUNC
+  local OPTION
+  local OS
+  local PNG
+  local RELEASE
+  local SVG
+  local HAS_ZSYNC=0
+
+  # Check if zsync is available
+  if command -v zsync &>/dev/null; then
+    HAS_ZSYNC=1
+  fi
+
+  if command -v aria2c &>/dev/null; then
+    DL="aria2c"
+  elif command -v wget &>/dev/null; then
+    DL="wget"
+  fi
+
+  echo "Display Name,OS,Release,Option,Downloader,PNG,SVG"
+  for OS in $(os_support); do
+    DISPLAY_NAME="$(pretty_name "${OS}")"
+    if [[ "${OS}" == *"ubuntu"* ]]; then
+      FUNC="ubuntu"
+    else
+      FUNC="${OS}"
+    fi
+    PNG="https://quickemu-project.github.io/quickemu-icons/png/${FUNC}/${FUNC}-quickemu-white-pinkbg.png"
+    SVG="https://quickemu-project.github.io/quickemu-icons/svg/${FUNC}/${FUNC}-quickemu-white-pinkbg.svg"
+
+    for RELEASE in $("releases_${FUNC}"); do
+      if [ "${OS}" == "macos" ]; then
+        DOWNLOADER="macrecovery"
+      elif [ "${OS}" == "ubuntu" ] && [ "${RELEASE}" == "canary" ] && [ ${HAS_ZSYNC} -eq 1 ]; then
+        DOWNLOADER="zsync"
+      elif [[ "${OS}" == *"ubuntu"* ]] && [ "${RELEASE}" == "devel" ] && [ ${HAS_ZSYNC} -eq 1 ]; then
+        DOWNLOADER="zsync"
+      else
+        DOWNLOADER="${DL}"
+      fi
+
+      # If the OS has an editions_() function, use it.
+      if [[ $(type -t "editions_${OS}") == function ]]; then
+        for OPTION in $(editions_"${OS}"); do
+          echo "${DISPLAY_NAME},${OS},${RELEASE},${OPTION},${DOWNLOADER},${PNG},${SVG}"
+        done
+      elif [ "${OS}" == "windows" ]; then
+        for OPTION in "${LANGS[@]}"; do
+          echo "${DISPLAY_NAME},${OS},${RELEASE},${OPTION},${DOWNLOADER},${PNG},${SVG}"
+        done
+      else
+        echo "${DISPLAY_NAME},${OS},${RELEASE},,${DOWNLOADER},${PNG},${SVG}"
+      fi
+    done
+  done
+  exit 0
+}
+
+function os_support() {
+    echo nixos 
+}
+
+function get_nixos() {
+    local EDITION="${1:-}"
+    local HASH=""
+    local ISO="latest-nixos-${EDITION}-aarch64-linux.iso"
+    local URL="https://channels.nixos.org/nixos-${RELEASE}"
+    HASH=$(wget -q -O- "${URL}/${ISO}.sha256" | cut -d' ' -f1)
+    echo "${URL}/${ISO} ${HASH}"
+}
+
+function releases_nixos(){
+    echo 22.11
+}
+
+function editions_nixos(){
+    echo gnome plasma5 minimal
+}
+
+function check_hash() {
+    local iso=""
+    local hash=""
+    local hash_algo=""
+    iso="${VM_PATH}/${1}"
+    hash="${2}"
+
+    # Guess the hash algorithm by the hash length
+    case ${#hash} in
+      32) hash_algo=md5sum;;
+      40) hash_algo=sha1sum;;
+      64) hash_algo=sha256sum;;
+      128) hash_algo=sha512sum;;
+       *) echo "WARNING! Can't guess hash algorithm, not checking ${iso} hash."
+          return;;
+    esac
+
+    echo -n "Checking ${iso} with ${hash_algo}... "
+    if ! echo "${hash} ${iso}" | ${hash_algo} --check --status; then
+        echo "ERROR!"
+        echo "${iso} doesn't match ${hash}. Try running 'quickget' again."
+        exit 1
+    else
+        echo "Good!"
+    fi
+}
+
+function web_get() {
+    local DIR="${2}"
+    local FILE=""
+    local URL="${1}"
+
+    if [ -n "${3}" ]; then
+        FILE="${3}"
+    else
+        FILE="${URL##*/}"
+    fi
+
+    if ! mkdir -p "${DIR}" 2>/dev/null; then
+      echo "ERROR! Unable to create directory ${DIR}"
+      exit 1
+    fi
+
+    if command -v aria2c &>/dev/null; then
+        if ! aria2c --stderr -x16 --continue=true --summary-interval=0 --download-result=hide --console-log-level=error "${URL}" -o "${DIR}/${FILE}"; then
+          echo #Necessary as aria2c in suppressed mode does not have new lines
+          echo "ERROR! Failed to download ${URL} with aria2c. Try running 'quickget' again."
+          exit 1
+        fi
+        echo #Necessary as aria2c in suppressed mode does not have new lines
+    else
+        if ! wget --quiet --continue --show-progress --progress=bar:force:noscroll "${URL}" -O "${DIR}/${FILE}"; then
+          echo "ERROR! Failed to download ${URL} with wget. Try running 'quickget' again."
+          exit 1
+        fi
+    fi
+}
+
+function zsync_get() {
+    local DIR="${2}"
+    local FILE="${1##*/}"
+    local OUT=""
+    local URL="${1}"
+
+    if command -v zsync &>/dev/null; then
+        if [ -n "${3}" ]; then
+            OUT="${3}"
+        else
+            OUT="${FILE}"
+        fi
+
+        if ! mkdir -p "${DIR}" 2>/dev/null; then
+          echo "ERROR! Unable to create directory ${DIR}"
+          exit 1
+        fi
+
+        # Only force http for zsync - not earlier because we might fall through here
+        if ! zsync "${URL/https/http}.zsync" -i "${DIR}/${OUT}" -o "${DIR}/${OUT}" 2>/dev/null; then
+            echo "ERROR! Failed to download ${URL/https/http}.zsync"
+            exit 1
+        fi
+
+        if [ -e "${DIR}/${OUT}.zs-old" ]; then
+            rm "${DIR}/${OUT}.zs-old"
+        fi
+    else
+        echo "INFO: zsync not found, falling back to wget/aria2c"
+        if [ -n "${3}" ]; then
+            web_get "${1}" "${2}" "${3}"
+        else
+            web_get "${1}" "${2}"
+        fi
+    fi
+}
+
+function make_vm_config() {
+    local CONF_FILE=""
+    local IMAGE_FILE=""
+    local ISO_FILE=""
+    local IMAGE_TYPE=""
+    local GUEST=""
+    local SEC_BOOT=""
+
+    IMAGE_FILE="${1}"
+    ISO_FILE="${2}"
+    case "${OS}" in
+        batocera)
+            GUEST="batocera"
+            IMAGE_TYPE="img";;
+        dragonflybsd)
+            GUEST="dragonflybsd"
+            IMAGE_TYPE="iso";;
+        freebsd|ghostbsd)
+            GUEST="freebsd"
+            IMAGE_TYPE="iso";;
+        haiku)
+            GUEST="haiku"
+            IMAGE_TYPE="iso";;
+        freedos)
+            GUEST="freedos"
+            IMAGE_TYPE="iso";;
+        kolibrios)
+            GUEST="kolibrios"
+            IMAGE_TYPE="iso";;
+        macos)
+            GUEST="macos"
+            IMAGE_TYPE="img";;
+        netbsd)
+            GUEST="netbsd"
+            IMAGE_TYPE="iso";;
+        openbsd)
+            GUEST="openbsd"
+            IMAGE_TYPE="iso";;
+        reactos)
+            GUEST="reactos"
+            IMAGE_TYPE="iso";;
+        truenas*)
+            GUEST="truenas"
+            IMAGE_TYPE="iso";;
+        windows)
+            GUEST="windows"
+            IMAGE_TYPE="iso";;
+        *)
+            GUEST="linux"
+            IMAGE_TYPE="iso";;
+    esac
+
+    if [ -n "${EDITION}" ]; then
+        CONF_FILE="${OS}-${RELEASE}-${EDITION}.conf"
+    else
+        CONF_FILE="${OS}-${RELEASE}.conf"
+    fi
+
+    if [ ! -e "${CONF_FILE}" ]; then
+        echo "Making ${CONF_FILE}"
+        cat << EOF > "${CONF_FILE}"
+#!$(which quickemu) --vm
+guest_os="${GUEST}"
+disk_img="${VM_PATH}/disk.qcow2"
+${IMAGE_TYPE}="${VM_PATH}/${IMAGE_FILE}"
+EOF
+        echo "Giving user execute permissions on ${CONF_FILE},"
+        chmod u+x "${CONF_FILE}"
+        if [ -n "${ISO_FILE}" ]; then
+            echo "fixed_iso=\"${VM_PATH}/${ISO_FILE}\"" >> "${CONF_FILE}"
+        fi
+
+    echo
+    echo "To start your $(pretty_name "${OS}") virtual machine run:"
+    echo "    quickemu --vm ${CONF_FILE}"
+    echo
+    exit 0
+}
